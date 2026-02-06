@@ -3,7 +3,7 @@
  * Plugin Name:       Microsoft Clarity
  * Plugin URI:        https://clarity.microsoft.com/
  * Description:       With data and session replay from Clarity, you'll see how people are using your site — where they get stuck and what they love.
- * Version:           0.10.7
+ * Version:           0.10.15
  * Author:            Microsoft
  * Author URI:        https://www.microsoft.com/en-us/
  * License:           MIT
@@ -12,6 +12,7 @@
 
 require_once plugin_dir_path( __FILE__ ) . '/clarity-page.php';
 require_once plugin_dir_path( __FILE__ ) . '/clarity-hooks.php';
+require_once plugin_dir_path( __FILE__ ) . '/clarity-server-analytics.php';
 
 /**
  * Runs when Clarity Plugin is activated.
@@ -117,6 +118,7 @@ function clrt_update_clarity_options_handler( $action, $network_wide ) {
 		case 'uninstall':
 			delete_option( 'clarity_wordpress_site_id' );
 			delete_option( 'clarity_project_id' );
+			delete_option( 'clarity_is_agent_enabled' );
 			break;
 	}
 }
@@ -133,15 +135,37 @@ function escape_value_for_script( $value ) {
  */
 add_action( 'wp_head', 'clarity_add_script_to_header' );
 function clarity_add_script_to_header() {
-	$p_id_option = get_option( 'clarity_project_id' );
-	if ( ! empty( $p_id_option ) ) {
+	$clarity_project_id = get_option( 'clarity_project_id' );
+	if ( ! empty( $clarity_project_id ) ) {
 		?>
 		<script type="text/javascript">
 				(function(c,l,a,r,i,t,y){
 					c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};t=l.createElement(r);t.async=1;
 					t.src="https://www.clarity.ms/tag/"+i+"?ref=wordpress";y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
-				})(window, document, "clarity", "script", "<?php echo escape_value_for_script( $p_id_option ); ?>");
+				})(window, document, "clarity", "script", "<?php echo escape_value_for_script( $clarity_project_id ); ?>");
 		</script>
+		<?php
+	}
+}
+
+/**
+ * Adds the script to run clarity.
+ */
+add_action( 'wp_head', 'brand_agent_add_script_to_header' );
+function brand_agent_add_script_to_header() {
+	$is_agent_enabled = get_option( 'clarity_is_agent_enabled');
+	$should_inject_brand_agents_script = should_inject_brand_agents_script();
+	if ( $is_agent_enabled == 1 && $should_inject_brand_agents_script) {
+		$frontend_injection_url = 'https://adsagentclientafd-b7hqhjdrf3fpeqh2.b01.azurefd.net/frontendInjection.js'
+		?>
+		<script>
+			(function() {
+				var script = document.createElement('script');
+				script.src = '<?php echo esc_js( $frontend_injection_url ); ?>';
+				script.type = 'module';
+				document.head.appendChild(script);
+			})();
+        </script>
 		<?php
 	}
 }
@@ -158,63 +182,94 @@ function clarity_page_link( $links ) {
 }
 
 /**
- * Send request info to Clarity BE.
+ * Retrieving the currently installed plugin version
  */
-add_action( 'init', 'clarity_send_request_info' );
-function clarity_send_request_info() {
-	$p_id_option = get_option( 'clarity_project_id' );
-	$clarity_wp_site = get_option('clarity_wordpress_site_id');
-	try {
-		if ( ! empty( $p_id_option ) && ! empty( $clarity_wp_site ) && ! is_admin() ) {
+function get_installed_plugin_version() {
+    if ( ! function_exists( 'get_plugin_data' ) ) {
+        require_once( ABSPATH . 'wp-admin/includes/plugin.php' );
+    }
 
-			$envelope = array(
-			'projectId'     => $p_id_option,
-			'sessionId'     => "",
-			'integrationId' => $clarity_wp_site,
-			'version'       => 'WordPress-0.10.7',
-			);
+    $plugin_data = get_plugin_data( plugin_dir_path( __FILE__ ) . 'clarity.php');
 
-			$analytics = array(
-			'time'   => time(),
-			'ip'     => get_ip_address(),
-			'ua'     => isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field($_SERVER['HTTP_USER_AGENT']) : 'Unkonwn',
-			'url'    => home_url($_SERVER['REQUEST_URI']),
-			'method' => isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'Unkonwn',
-			);
+    return $plugin_data['Version'];
+}
 
-			$body = array(
-				'envelope'  => $envelope,
-				'analytics' => $analytics,
-			);
+/**
+ * Retrieving the latest version from the WordPress.org repository.
+ */
+function get_latest_plugin_version_from_api() {
+    $api_url = 'http://api.wordpress.org/plugins/info/1.0/microsoft-clarity.json';
+    $response = wp_remote_get( $api_url );
 
-			$args = array(
-				'body'        => json_encode($body),
-				'timeout'     => '1',
-				'redirection' => '5',
-				'httpversion' => '1.0',
-				'blocking'    => false,
-				'headers'     => array( 'Content-Type' => 'application/json' ),
-				'cookies'     => array(),
-			);
+    if ( is_wp_error( $response ) ) {
+        return false;
+    }
 
-			$response = wp_remote_post('https://ai.clarity.ms/collect-request', $args );
-		}
-	} catch (Throwable $e) {
-		// do nothing
+    $body = wp_remote_retrieve_body( $response );
+    $plugin_info = json_decode( $body );
+
+    if ( $plugin_info && isset( $plugin_info->version ) ) {
+        return $plugin_info->version;
+    }
+
+    return false;
+}
+
+/**
+ * Checking if the current plugin version is latest
+ */
+add_action( 'admin_init', 'check_if_installed_plugin_version_is_latest' );
+function check_if_installed_plugin_version_is_latest() {
+	$installed_version = get_installed_plugin_version();
+	$latest_version = get_latest_plugin_version_from_api();
+
+   if ( $installed_version && $latest_version ) {
+    	if ( version_compare( $installed_version, $latest_version, '<' ) ) {
+			update_option( 'clarity_is_latest_plugin_version', '0' );
+    	} else {
+			update_option( 'clarity_is_latest_plugin_version', '1' );
+    	}
 	}
 }
 
-// ref: https://usersinsights.com/wordpress-get-user-ip/
-function get_ip_address(){
-    foreach (array('HTTP_CLIENT_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED', 'HTTP_X_CLUSTER_CLIENT_IP', 'HTTP_FORWARDED_FOR', 'HTTP_FORWARDED', 'REMOTE_ADDR') as $key){
-        if (array_key_exists($key, $_SERVER) === true){
-            foreach (explode(',', $_SERVER[$key]) as $ip){
-                $ip = trim($ip);
-
-                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false){
-                    return $ip;
-                }
-            }
-        }
+/**
+* Check if script should be injected on current page
+*/
+function should_inject_brand_agents_script() {
+    // Inject on WooCommerce pages
+    if ( function_exists( 'is_woocommerce' ) && is_woocommerce() ) {
+        return true;
     }
+    
+    // Inject on shop page
+    if ( function_exists( 'is_shop' ) && is_shop() ) {
+        return true;
+    }
+    
+    // Inject on product pages
+    if ( function_exists( 'is_product' ) && is_product() ) {
+        return true;
+    }
+    
+    // Inject on cart page
+    if ( function_exists( 'is_cart' ) && is_cart() ) {
+        return true;
+    }
+    
+    // Inject on checkout page
+    if ( function_exists( 'is_checkout' ) && is_checkout() ) {
+        return true;
+    }
+    
+    // Inject on account pages
+    if ( function_exists( 'is_account_page' ) && is_account_page() ) {
+        return true;
+    }
+    
+    // Inject on homepage if it's the shop
+    if ( is_front_page() && get_option( 'show_on_front' ) === 'page' && function_exists( 'wc_get_page_id' ) && get_option( 'page_on_front' ) == wc_get_page_id( 'shop' ) ) {
+        return true;
+    }
+    
+    return false;
 }
