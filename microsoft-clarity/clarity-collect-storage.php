@@ -62,6 +62,8 @@ function clarity_insert_collect_event($event)
         clarity_create_collect_events_table();
     }
 
+    clarity_maybe_schedule_collect_recurring();
+
     $payload = wp_json_encode($event);
     if ($payload === false) { // wp_json_encode returns false on failure
         return false;

@@ -30,9 +30,9 @@ function clarity_register_collect_schedule($schedules)
 add_filter('cron_schedules', 'clarity_register_collect_schedule');
 
 /**
- * Schedules the recurring batch worker.
+ * Schedules the recurring batch worker if not already scheduled.
  */
-function clarity_schedule_collect_recurring()
+function clarity_maybe_schedule_collect_recurring()
 {
     if (wp_next_scheduled(CLARITY_COLLECT_CRON_HOOK)) {
         return;

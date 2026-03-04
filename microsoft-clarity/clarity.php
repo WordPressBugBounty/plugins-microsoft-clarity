@@ -4,7 +4,7 @@
  * Plugin Name:       Microsoft Clarity
  * Plugin URI:        https://clarity.microsoft.com/
  * Description:       With data and session replay from Clarity, you'll see how people are using your site — where they get stuck and what they love.
- * Version:           0.10.19
+ * Version:           0.10.20
  * Author:            Microsoft
  * Author URI:        https://www.microsoft.com/en-us/
  * License:           MIT
@@ -110,9 +110,6 @@ function clrt_update_clarity_options_handler($action, $network_wide)
 			if (! $id) {
 				update_option('clarity_wordpress_site_id', wp_generate_uuid4());
 			}
-
-			clarity_create_collect_events_table();
-			clarity_schedule_collect_recurring();
 			break;
 		case 'deactivate':
 			// Plugin activation/deactivation is handled differently in the database for site-level and network-wide activation.

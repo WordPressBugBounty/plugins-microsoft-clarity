@@ -22,6 +22,14 @@ function refresh_wordpress_id_option()
 }
 
 /**
+ * Detects whether this site is hosted on WordPress.com.
+ **/
+function clarity_is_wordpress_com_hosted()
+{
+    return defined('IS_WPCOM') && IS_WPCOM;
+}
+
+/**
  * Displays the embedded iframe in Clarity settings
  **/
 function clarity_section_iframe_callback()
@@ -38,10 +46,11 @@ function clarity_section_iframe_callback()
     );
 
     $site_url = home_url();
+    $hosting_type = clarity_is_wordpress_com_hosted() ? 'wpcom' : 'selfhosted';
 
     $clarity_domain = "https://clarity.microsoft.com/embed";
 
-    $query_params = "?nonce=$nonce&integration=Wordpress&wpsite=$clarity_wp_site&siteurl=$site_url";
+    $query_params = "?nonce=$nonce&integration=Wordpress&wpsite=$clarity_wp_site&siteurl=$site_url&hostingtype=$hosting_type";
 
     // set a QP if user is admin
     if (current_user_can('manage_options')) {
