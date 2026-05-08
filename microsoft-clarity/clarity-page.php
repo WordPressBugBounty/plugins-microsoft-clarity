@@ -67,6 +67,8 @@ function brandagent_handle_remove_from_waitlist_success_callback() {
         delete_option( 'BAOauthSuccess' );
         delete_option( 'BAInjectFrontendScript' );
         delete_option( 'BAOauthRepairDone' );
+        delete_option( 'BAWebhooksCreated' );
+        delete_option( 'BAWebhooksBackfillDone' );
         delete_option( 'clarity_ba_eligible_triggered' );
         brandagent_delete_hmac_secret();
 
@@ -103,6 +105,10 @@ function brandagent_handle_oauth_callback() {
     // WooCommerce adds success=1 to the return URL when the callback was successful
     $wc_success = isset($_GET['success']) && $_GET['success'] == '1';
     $success = false;
+    brandagent_log( 'BrandAgent OAuth: Callback received', array(
+        'wc_success' => $wc_success,
+        'oauth_present' => ! empty( $oauth_token ),
+    ) );
 
     if ($wc_success && !empty($oauth_token)) {
         // Pull the HMAC secret from Clarity server (server-to-server, secret in response body)
@@ -137,19 +143,26 @@ function brandagent_handle_oauth_callback() {
                 if ( json_last_error() !== JSON_ERROR_NONE ) {
                     brandagent_log( 'BrandAgent OAuth: ERROR - JSON parse failed: ' . json_last_error_msg() );
                 } elseif ( isset( $body['success'] ) && $body['success'] === true && ! empty( $body['hmac_secret'] ) ) {
-                    brandagent_store_hmac_secret( $body['hmac_secret'] );
+                    $hmac_secret_stored = brandagent_store_hmac_secret( $body['hmac_secret'] );
                     update_option( 'BAOauthSuccess', true );
                     $success = true;
-                    brandagent_log( 'BrandAgent OAuth: SUCCESS - HMAC secret stored, BAOauthSuccess set.' );
+                    brandagent_log( 'BrandAgent OAuth: SUCCESS - HMAC secret handled, BAOauthSuccess set.', array( 'hmac_stored' => $hmac_secret_stored ) );
                 } else {
-                    brandagent_log( 'BrandAgent OAuth: ERROR - Unexpected response from fetch-secret' );
+                    brandagent_log( 'BrandAgent OAuth: ERROR - Unexpected response from fetch-secret', array(
+                        'status_code' => $status_code,
+                        'success_present' => isset( $body['success'] ),
+                        'hmac_present' => isset( $body['hmac_secret'] ) && ! empty( $body['hmac_secret'] ),
+                    ) );
                 }
             } else {
-                brandagent_log( 'BrandAgent OAuth: ERROR - fetch-secret returned status ' . $status_code );
+                brandagent_log( 'BrandAgent OAuth: ERROR - fetch-secret returned non-success status', array( 'status_code' => $status_code ) );
             }
         }
     } else {
-        brandagent_log( 'BrandAgent OAuth: SKIPPED - wc_success=' . ($wc_success ? 'true' : 'false') . ', oauth_token=' . (!empty($oauth_token) ? 'present' : 'MISSING') );
+        brandagent_log( 'BrandAgent OAuth: SKIPPED - WooCommerce success or OAuth token missing', array(
+            'wc_success' => $wc_success,
+            'oauth_present' => ! empty( $oauth_token ),
+        ) );
     }
 
     ?>
@@ -188,6 +201,7 @@ function brandagent_handle_refresh_credentials_callback() {
 
     $oauth_token = isset( $_GET['oauth_token'] ) ? sanitize_text_field( $_GET['oauth_token'] ) : '';
     $success = false;
+    brandagent_log( 'BrandAgent Refresh: Callback received', array( 'oauth_present' => ! empty( $oauth_token ) ) );
 
     if ( ! empty( $oauth_token ) ) {
         // Ensure BrandAgent_Config is loaded
@@ -223,14 +237,18 @@ function brandagent_handle_refresh_credentials_callback() {
                 if ( json_last_error() !== JSON_ERROR_NONE ) {
                     brandagent_log( 'BrandAgent Refresh: ERROR - JSON parse failed: ' . json_last_error_msg() );
                 } elseif ( isset( $body['success'] ) && $body['success'] === true && ! empty( $body['hmac_secret'] ) ) {
-                    brandagent_store_hmac_secret( $body['hmac_secret'] );
+                    $hmac_secret_stored = brandagent_store_hmac_secret( $body['hmac_secret'] );
                     $success = true;
-                    brandagent_log( 'BrandAgent Refresh: SUCCESS - New HMAC secret stored.' );
+                    brandagent_log( 'BrandAgent Refresh: SUCCESS - New HMAC secret handled.', array( 'hmac_stored' => $hmac_secret_stored ) );
                 } else {
-                    brandagent_log( 'BrandAgent Refresh: ERROR - Unexpected response from fetch-secret' );
+                    brandagent_log( 'BrandAgent Refresh: ERROR - Unexpected response from fetch-secret', array(
+                        'status_code' => $status_code,
+                        'success_present' => isset( $body['success'] ),
+                        'hmac_present' => isset( $body['hmac_secret'] ) && ! empty( $body['hmac_secret'] ),
+                    ) );
                 }
             } else {
-                brandagent_log( 'BrandAgent Refresh: ERROR - fetch-secret returned status ' . $status_code );
+                brandagent_log( 'BrandAgent Refresh: ERROR - fetch-secret returned non-success status', array( 'status_code' => $status_code ) );
             }
         }
     } else {
@@ -674,13 +692,18 @@ function clarity_trigger_ba_eligibility( $store_url ) {
 
     // Non-blocking: we don't need the response — just need to trigger the request
     // so the BA server starts the RAI check.
-    wp_remote_post( $endpoint, array(
+    $response = wp_remote_post( $endpoint, array(
         'timeout'  => 0.01,
         'blocking' => false,
         'headers'  => array( 'Content-Type' => 'application/json' ),
         'body'     => wp_json_encode( array( 'storeUrl' => $store_url ) ),
     ) );
 
+    if ( is_wp_error( $response ) ) {
+        brandagent_log( 'BrandAgent Eligibility: ERROR - failed to trigger check', array( 'error' => $response->get_error_message() ) );
+    }
+
     // Mark as triggered so we don't re-fire on every admin page load
     update_option( 'clarity_ba_eligible_triggered', '1' );
+    brandagent_log( 'BrandAgent Eligibility: marked eligibility trigger as completed', array( 'store_url' => $store_url ) );
 }
