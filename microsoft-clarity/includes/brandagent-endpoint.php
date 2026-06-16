@@ -319,7 +319,6 @@ class BrandAgent_Endpoint {
         update_option( 'BAInjectFrontendScript', $new_value ? 'true' : 'false' );
 
         brandagent_log( 'BrandAgent Config Update: BAInjectFrontendScript updated', array(
-            'old_value' => $old_value,
             'new_value' => $new_value ? 'true' : 'false',
         ) );
 
@@ -327,38 +326,35 @@ class BrandAgent_Endpoint {
         if ( $new_value
              && get_option( 'BAOauthSuccess' ) == 1
              && ! get_option( 'BAWebhooksCreated' ) ) {
-            // Complete onboarding (HMAC-signed request through Clarity proxy)
-            $clarity_domain = BrandAgent_Config::get_clarity_server_url();
-            $complete_onboarding_endpoint = $clarity_domain . '/woocommerce/complete-onboarding';
-            brandagent_log( 'BrandAgent Config Update: Calling complete-onboarding after approval', array( 'endpoint' => $complete_onboarding_endpoint, 'store_url' => home_url() ) );
-            $response = brandagent_sign_outbound_request( $complete_onboarding_endpoint, wp_json_encode( array( 'storeUrl' => home_url() ) ) );
-
-            if ( is_wp_error( $response ) ) {
-                brandagent_log( 'BrandAgent Config Update: Failed to notify complete-onboarding', array( 'error' => $response->get_error_message() ) );
-            } else {
-                $status_code = wp_remote_retrieve_response_code( $response );
-                if ( $status_code === 200 ) {
-                    // Create/update all webhooks only on successful onboarding
-                    if ( class_exists( 'BrandAgent_Webhooks' ) ) {
-                        $results = BrandAgent_Webhooks::create_webhooks();
-                        $success_count = count( array_filter( $results ) );
-                        update_option( 'BAWebhooksCreated', true );
-                        brandagent_log( 'BrandAgent Config Update: Webhooks created on store approval', array(
-                            'webhook_count' => count( $results ),
-                            'success_count' => $success_count,
-                            'failure_count' => count( $results ) - $success_count,
-                        ) );
-                    } else {
-                        brandagent_log( 'BrandAgent Config Update: BrandAgent_Webhooks class not available for store approval webhook creation' );
-                    }
+            // BA server has already handled complete-onboarding via PublishAgent.
+            // The plugin's only job here is to register WooCommerce webhooks.
+            if ( class_exists( 'BrandAgent_Webhooks' ) ) {
+                $results       = BrandAgent_Webhooks::create_webhooks();
+                $webhook_count = is_array( $results ) ? count( $results ) : 0;
+                $success_count = is_array( $results ) ? count( array_filter( $results ) ) : 0;
+                $failure_count = $webhook_count - $success_count;
+                $all_succeeded = ( 0 < $webhook_count && 0 === $failure_count );
+                if ( $all_succeeded ) {
+                    update_option( 'BAWebhooksCreated', true );
+                    brandagent_log( 'BrandAgent Config Update: Webhooks created on store approval', array(
+                        'webhook_count' => $webhook_count,
+                        'success_count' => $success_count,
+                        'failure_count' => $failure_count,
+                    ) );
                 } else {
-                    brandagent_log( 'BrandAgent Config Update: complete-onboarding returned non-success status; skipping webhook creation', array( 'status_code' => $status_code ) );
+                    // Do NOT persist BAWebhooksCreated on partial/failed creation so future attempts can retry.
+                    brandagent_log( 'BrandAgent Config Update: Webhook creation incomplete; will retry on next update', array(
+                        'webhook_count' => $webhook_count,
+                        'success_count' => $success_count,
+                        'failure_count' => $failure_count,
+                    ) );
                 }
+            } else {
+                brandagent_log( 'BrandAgent Config Update: BrandAgent_Webhooks class not available for store approval webhook creation' );
             }
         } else {
             brandagent_log( 'BrandAgent Config Update: No onboarding side effects required', array(
-                'old_value' => $old_value,
-                'new_value' => $new_value ? 'true' : 'false',
+                'new_value'     => $new_value ? 'true' : 'false',
                 'oauth_success' => get_option( 'BAOauthSuccess' ) == 1,
             ) );
         }

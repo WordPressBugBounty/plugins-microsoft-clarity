@@ -321,11 +321,6 @@ function clarity_section_iframe_callback()
     // set a QP if user is WooCommerce plugin is active
     if (class_exists('woocommerce')) {
         $query_params = $query_params . "&WooCommerce=1";
-
-        // Trigger RAI eligibility check on BA server (fire-and-forget, once per install)
-        if ( get_option( 'clarity_ba_eligible_triggered', '' ) === '' ) {
-            clarity_trigger_ba_eligibility( $site_url );
-        }
     }
 
     // set a QP if permalink structure is plain (required for Brand Agent rewrite rules)
@@ -668,42 +663,4 @@ function plugin_admin_notices()
     }
 }
 
-/**
-* Trigger the Brand Agent eligibility (RAI) check via Clarity server proxy.
-* Fire-and-forget — the plugin doesn't need the result. The BA server caches it
-* for the Clarity Dashboard to read later. Uses a non-blocking request so the
-* admin page isn't delayed.
-*/
-function clarity_trigger_ba_eligibility( $store_url ) {
-    if ( ! class_exists( 'BrandAgent_Config' ) ) {
-        $config_path = plugin_dir_path( __FILE__ ) . 'includes/brandagent-config.php';
-        if ( file_exists( $config_path ) ) {
-            require_once $config_path;
-        } else {
-            brandagent_log( 'BrandAgent Eligibility: ERROR - Config file not found at ' . $config_path );
-            return;
-        }
-    }
 
-    $clarity_server_url = BrandAgent_Config::get_clarity_server_url();
-    $endpoint = $clarity_server_url . '/woocommerce/is-eligible';
-
-    brandagent_log( 'BrandAgent Eligibility: triggering check for ' . $store_url . ' via ' . $endpoint );
-
-    // Non-blocking: we don't need the response — just need to trigger the request
-    // so the BA server starts the RAI check.
-    $response = wp_remote_post( $endpoint, array(
-        'timeout'  => 0.01,
-        'blocking' => false,
-        'headers'  => array( 'Content-Type' => 'application/json' ),
-        'body'     => wp_json_encode( array( 'storeUrl' => $store_url ) ),
-    ) );
-
-    if ( is_wp_error( $response ) ) {
-        brandagent_log( 'BrandAgent Eligibility: ERROR - failed to trigger check', array( 'error' => $response->get_error_message() ) );
-    }
-
-    // Mark as triggered so we don't re-fire on every admin page load
-    update_option( 'clarity_ba_eligible_triggered', '1' );
-    brandagent_log( 'BrandAgent Eligibility: marked eligibility trigger as completed', array( 'store_url' => $store_url ) );
-}

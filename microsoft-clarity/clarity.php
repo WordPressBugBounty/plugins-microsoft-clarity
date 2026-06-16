@@ -4,7 +4,7 @@
  * Plugin Name:       Microsoft Clarity
  * Plugin URI:        https://clarity.microsoft.com/
  * Description:       With data and session replay from Clarity, you'll see how people are using your site — where they get stuck and what they love.
- * Version:           0.10.24
+ * Version:           0.10.25
  * Author:            Microsoft
  * Author URI:        https://www.microsoft.com/en-us/
  * License:           MIT
@@ -36,6 +36,82 @@ function clarity_on_activation($network_wide)
 	// Register Brand Agent routes and flush rewrite rules
 	brandagent_register_routes();
 	flush_rewrite_rules();
+
+	// Notify the BA server that the plugin was installed and trigger upsell product ingest
+	// (fire-and-forget, non-blocking). On multisite network activation, notify once per site
+	// so backend state is consistent for each subsite's home_url().
+	$clarity_server_url = BrandAgent_Config::get_clarity_server_url();
+	if ( ! empty( $clarity_server_url ) ) {
+		$store_urls = array();
+
+		if ( is_multisite() && $network_wide ) {
+			foreach ( get_sites() as $site ) {
+				switch_to_blog( (int) $site->blog_id );
+				$store_urls[] = home_url();
+				restore_current_blog();
+			}
+		} else {
+			$store_urls[] = home_url();
+		}
+
+		$base_url                  = trailingslashit( $clarity_server_url );
+		$plugin_installed_endpoint = $base_url . 'woocommerce/plugin-installed';
+		$upsell_ingest_endpoint    = $base_url . 'woocommerce/upsell-ingest';
+
+		foreach ( $store_urls as $store_url ) {
+			$request_args = array(
+				'blocking' => false,
+				'timeout'  => 3,
+				'headers'  => array( 'Content-Type' => 'application/json' ),
+				'body'     => wp_json_encode( array( 'storeUrl' => $store_url ) ),
+			);
+
+			// plugin-installed: BA server creates AdvertiserMetadata for this store.
+			// Even with blocking=false, wp_remote_post() can fail immediately (e.g., invalid URL, transport error).
+			$response = wp_remote_post( $plugin_installed_endpoint, $request_args );
+			if ( is_wp_error( $response ) ) {
+				brandagent_log(
+					'BrandAgent Lifecycle: plugin-installed call failed; retrying once',
+					array(
+						'endpoint' => $plugin_installed_endpoint,
+						'error'    => $response->get_error_message(),
+					)
+				);
+				$response = wp_remote_post( $plugin_installed_endpoint, $request_args );
+				if ( is_wp_error( $response ) ) {
+					brandagent_log(
+						'BrandAgent Lifecycle: plugin-installed call failed after retry',
+						array(
+							'endpoint' => $plugin_installed_endpoint,
+							'error'    => $response->get_error_message(),
+						)
+					);
+				}
+			}
+
+			// upsell-ingest: pre-index products so they are ready before the merchant reaches publish.
+			$response = wp_remote_post( $upsell_ingest_endpoint, $request_args );
+			if ( is_wp_error( $response ) ) {
+				brandagent_log(
+					'BrandAgent Lifecycle: upsell-ingest call failed; retrying once',
+					array(
+						'endpoint' => $upsell_ingest_endpoint,
+						'error'    => $response->get_error_message(),
+					)
+				);
+				$response = wp_remote_post( $upsell_ingest_endpoint, $request_args );
+				if ( is_wp_error( $response ) ) {
+					brandagent_log(
+						'BrandAgent Lifecycle: upsell-ingest call failed after retry',
+						array(
+							'endpoint' => $upsell_ingest_endpoint,
+							'error'    => $response->get_error_message(),
+						)
+					);
+				}
+			}
+		}
+	}
 
 	// Don't do redirects when multiple plugins are bulk activated
 	if (
