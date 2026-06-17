@@ -623,6 +623,21 @@ function plugin_perform_update()
     include_once(ABSPATH . 'wp-admin/includes/class-wp-upgrader.php');
     include_once(ABSPATH . 'wp-admin/includes/plugin.php');
 
+    // Refresh core's update data so Plugin_Upgrader has a real package to download.
+    wp_clean_plugins_cache(true);
+    wp_update_plugins();
+
+    $update_plugins = get_site_transient('update_plugins');
+    $has_pending_update = isset($update_plugins->response[$plugin_slug]);
+
+    if (! $has_pending_update) {
+        // Already on the latest version: clear the stale flag and report success, not failure.
+        set_transient('clarity_is_latest_plugin_version', '1', 24 * 60 * 60);
+        $redirect_url = add_query_arg('plugin_updated', '1', admin_url('admin.php?page=microsoft-clarity'));
+        wp_redirect(esc_url($redirect_url));
+        exit;
+    }
+
     // Create a custom skin to handle output and redirection
     $upgrader_skin = new Automatic_Upgrader_Skin();
     $upgrader      = new Plugin_Upgrader($upgrader_skin);

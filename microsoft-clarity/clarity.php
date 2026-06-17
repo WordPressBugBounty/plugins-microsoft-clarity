@@ -4,7 +4,7 @@
  * Plugin Name:       Microsoft Clarity
  * Plugin URI:        https://clarity.microsoft.com/
  * Description:       With data and session replay from Clarity, you'll see how people are using your site — where they get stuck and what they love.
- * Version:           0.10.25
+ * Version:           0.10.26
  * Author:            Microsoft
  * Author URI:        https://www.microsoft.com/en-us/
  * License:           MIT
@@ -196,6 +196,9 @@ function clrt_update_clarity_options_handler($action, $network_wide)
 				update_option('clarity_wordpress_site_id', wp_generate_uuid4());
 			}
 
+			// Clear the cached version flag so a reinstall re-evaluates instead of inheriting a stale banner.
+			delete_transient('clarity_is_latest_plugin_version');
+
 			// Initialize BAInjectFrontendScript with default value
 			if ( get_option( 'BAInjectFrontendScript' ) === false ) {
 				add_option( 'BAInjectFrontendScript', 'false' );
@@ -247,6 +250,8 @@ function clrt_update_clarity_options_handler($action, $network_wide)
 			delete_option( 'clarity_ba_eligible_triggered' );
 			// Cleanup for the option used up to version 0.10.16. Should remove this after users migrate to 0.10.17+ where this option is no longer used.
 			delete_option('clarity_collect_batch');
+			// Remove the cached banner flag so it can't linger and resurface on reinstall.
+			delete_transient('clarity_is_latest_plugin_version');
 			clarity_flush_and_clear_collect_recurring();
 			clarity_drop_collect_events_table();
 
@@ -455,18 +460,29 @@ function check_if_installed_plugin_version_is_latest()
 }
 
 /**
- * Clear cached plugin-version status after this plugin is updated.
+ * Clear cached plugin-version status after this plugin is installed or updated.
  * This is needed to avoid showing a banner after update due to stale cache.
  */
 add_action('upgrader_process_complete', 'clarity_invalidate_latest_version_transient_on_update', 10, 2);
 function clarity_invalidate_latest_version_transient_on_update($upgrader_object, $options)
 {
-	if (
-		! is_array($options) ||
-		($options['type'] ?? '') !== 'plugin' ||
-		($options['action'] ?? '') !== 'update' ||
-		! in_array(plugin_basename(__FILE__), (array) ($options['plugins'] ?? array()), true)
-	) {
+	if (! is_array($options) || ($options['type'] ?? '') !== 'plugin') {
+		return;
+	}
+
+	$action = $options['action'] ?? '';
+	if ($action !== 'update' && $action !== 'install') {
+		return;
+	}
+
+	// Bulk updates pass a 'plugins' array; single update/install passes a 'plugin' string.
+	$affected_plugins = (array) ($options['plugins'] ?? array());
+	if (! empty($options['plugin'])) {
+		$affected_plugins[] = $options['plugin'];
+	}
+
+	// On overwrite-install the affected plugin isn't always reported; clear anyway to be safe.
+	if (! empty($affected_plugins) && ! in_array(plugin_basename(__FILE__), $affected_plugins, true)) {
 		return;
 	}
 
