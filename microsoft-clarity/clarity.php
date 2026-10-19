@@ -4,7 +4,7 @@
  * Plugin Name:       Microsoft Clarity
  * Plugin URI:        https://clarity.microsoft.com/
  * Description:       With data and session replay from Clarity, you'll see how people are using your site — where they get stuck and what they love.
- * Version:           0.10.35
+ * Version:           0.10.36
  * Author:            Microsoft
  * Author URI:        https://www.microsoft.com/en-us/
  * License:           MIT
@@ -295,6 +295,7 @@ function clrt_update_clarity_options_handler($action, $network_wide)
 			delete_option( 'BAOauthRepairDone' );
 			delete_option( 'BAWebhooksCreated' );
 			delete_option( 'BAWebhooksBackfillDone' );
+			delete_option( 'BACollectionWebhooksMigrationDone' );
 			delete_option( 'clarity_ba_eligible_triggered' );
 			// Plain-WordPress connect bookkeeping. Without this a reinstall still looks opted in, and
 			// brandagent_wordpress_maybe_resume_connect() silently reconnects a site the merchant just
@@ -379,6 +380,28 @@ function brand_agent_should_inject_frontend_script()
 }
 
 /**
+ * Expose the local WordPress proxy base before either frontend loader path runs.
+ *
+ * The Brand Agent frontend needs this path for its unauthenticated config/read and init calls. A
+ * meta tag works for both the Script Modules API and the legacy inline loader without exposing the
+ * connected host, project ID or credentials.
+ */
+function brand_agent_add_proxy_base_meta()
+{
+	if ( ! brand_agent_should_inject_frontend_script() ) {
+		return;
+	}
+
+	$proxy_base_path = brandagent_get_frontend_proxy_base_path();
+	if ( false === $proxy_base_path ) {
+		return;
+	}
+
+	echo '<meta name="msba-wordpress-proxy-base" content="' . esc_attr( $proxy_base_path ) . '">' . "\n";
+}
+add_action( 'wp_head', 'brand_agent_add_proxy_base_meta', 1 );
+
+/**
  * Enqueue the Brand Agent loader through the WordPress Script Modules API
  * (WordPress 6.5+). Letting core emit the module tag guarantees it is printed
  * AFTER the import map (in <head> for block themes, in the footer for classic
@@ -396,6 +419,11 @@ function brand_agent_enqueue_frontend_module()
 	}
 
 	if ( ! brand_agent_should_inject_frontend_script() ) {
+		return;
+	}
+
+	// A malformed persisted connection URL must not fall back to the origin-root proxy.
+	if ( false === brandagent_get_frontend_proxy_base_path() ) {
 		return;
 	}
 
@@ -422,6 +450,11 @@ function brand_agent_add_script_to_header()
 	}
 
 	if ( ! brand_agent_should_inject_frontend_script() ) {
+		return;
+	}
+
+	// A malformed persisted connection URL must not fall back to the origin-root proxy.
+	if ( false === brandagent_get_frontend_proxy_base_path() ) {
 		return;
 	}
 
@@ -520,6 +553,53 @@ function clarity_backfill_webhooks_created() {
 	}
 
 	update_option('BAWebhooksBackfillDone', true);
+}
+
+/**
+ * One-time migration: register collection webhooks for existing WooCommerce merchants.
+ */
+add_action('admin_init', 'clarity_migrate_collection_webhooks');
+function clarity_migrate_collection_webhooks() {
+	if ( get_option('BACollectionWebhooksMigrationDone') ) {
+		return;
+	}
+
+	if ( get_option('BAOauthSuccess') != 1
+		 || get_option('BAInjectFrontendScript') !== 'true' ) {
+		return;
+	}
+
+	if ( brandagent_get_hmac_platform() !== 'woocommerce' ) {
+		return;
+	}
+
+	if ( ! class_exists('BrandAgent_Webhooks') || ! class_exists('WC_Webhook') ) {
+		return;
+	}
+
+	if ( ! brandagent_get_hmac_secret() ) {
+		brandagent_log( 'BrandAgent Collection Webhook Migration: HMAC secret unavailable; will retry' );
+		return;
+	}
+
+	$results       = BrandAgent_Webhooks::create_collection_webhooks();
+	$webhook_count = is_array($results) ? count($results) : 0;
+	$success_count = is_array($results) ? count(array_filter($results)) : 0;
+	$failure_count = $webhook_count - $success_count;
+
+	if ( 0 < $webhook_count && 0 === $failure_count ) {
+		update_option('BACollectionWebhooksMigrationDone', true);
+		brandagent_log( 'BrandAgent Collection Webhook Migration: Webhooks reconciled', array(
+			'webhook_count' => $webhook_count,
+		) );
+		return;
+	}
+
+	brandagent_log( 'BrandAgent Collection Webhook Migration: Webhook reconciliation incomplete; will retry', array(
+		'webhook_count' => $webhook_count,
+		'success_count' => $success_count,
+		'failure_count' => $failure_count,
+	) );
 }
 
 /**
@@ -688,9 +768,9 @@ function brandagent_allowlist_yoast_permalink_vars( $vars ) {
 /**
  * Determine whether the current URL path is in the Brand Agent API namespace.
  *
- * The home path and optional index.php front controller are removed before the
- * namespace check so subdirectory and non-pretty-permalink installations work
- * without accepting the same path when it is embedded in an unrelated URL.
+ * The stable configured home path and optional index.php front controller are removed before the
+ * namespace check so subdirectory and index.php PATHINFO-permalink installations use the same route base
+ * advertised to the frontend without accepting an embedded path on an unrelated URL.
  *
  * @return bool True for a Brand Agent API path.
  */
@@ -707,20 +787,16 @@ function brandagent_is_api_request_path() {
         return false;
     }
 
-    $site_home_url = home_url( '/' );
-    $home_path     = function_exists( 'wp_parse_url' )
-        ? wp_parse_url( $site_home_url, PHP_URL_PATH )
-        : parse_url( $site_home_url, PHP_URL_PATH ); // phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- Required for the declared WordPress 4.0 minimum.
-    $home_path = is_string( $home_path ) ? '/' . trim( $home_path, '/' ) : '';
-    if ( '/' === $home_path ) {
-        $home_path = '';
+    $installation_path = brandagent_get_frontend_proxy_installation_path();
+    if ( false === $installation_path ) {
+        return false;
     }
 
-    if ( '' !== $home_path ) {
-        if ( strpos( $request_path, $home_path . '/' ) !== 0 ) {
+    if ( '' !== $installation_path ) {
+        if ( strpos( $request_path, $installation_path . '/' ) !== 0 ) {
             return false;
         }
-        $request_path = substr( $request_path, strlen( $home_path ) );
+        $request_path = substr( $request_path, strlen( $installation_path ) );
     }
 
     if ( strpos( $request_path, '/index.php/' ) === 0 ) {

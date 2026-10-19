@@ -69,6 +69,7 @@ function brandagent_handle_remove_from_waitlist_success_callback() {
         delete_option( 'BAOauthRepairDone' );
         delete_option( 'BAWebhooksCreated' );
         delete_option( 'BAWebhooksBackfillDone' );
+        delete_option( 'BACollectionWebhooksMigrationDone' );
         delete_option( 'clarity_ba_eligible_triggered' );
         delete_option( 'brandagent_wp_connect_optin' );
         delete_option( 'brandagent_wp_connect_attempts' );
@@ -377,6 +378,13 @@ function clarity_section_iframe_callback()
     $site_url = $is_woocommerce
         ? ( $can_manage_options ? brandagent_prepare_woocommerce_oauth_url() : brandagent_get_woocommerce_oauth_callback_url() )
         : brandagent_get_connected_store_url();
+    if ( $is_woocommerce && is_wp_error( $site_url ) && 'brandagent_invalid_frontend_routing' === $site_url->get_error_code() ) {
+        // BA routing restrictions must not prevent ordinary Clarity viewing.
+        $display_url = brandagent_get_connected_store_url();
+        if ( false !== brandagent_get_safe_installation_path_from_url( $display_url ) ) {
+            $site_url = $display_url;
+        }
+    }
     if ( $is_woocommerce && ! $can_manage_options && is_wp_error( $site_url )
         && in_array( $site_url->get_error_code(), array( 'brandagent_oauth_url_missing', 'brandagent_oauth_url_conflict' ), true ) ) {
         // Ordinary Clarity viewing needs a display URL, not a reserved OAuth identity.

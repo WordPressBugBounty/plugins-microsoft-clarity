@@ -25,6 +25,7 @@ define( 'BRANDAGENT_CONNECTOR_DEFAULT_DURATION_MINUTES', 60 );
 define( 'BRANDAGENT_CONNECTOR_MAXIMUM_SERVICE_COUNT', 200 );
 define( 'BRANDAGENT_CONNECTOR_MAXIMUM_SERVICE_ID_BYTES', 512 );
 define( 'BRANDAGENT_CONNECTOR_MAXIMUM_SERVICE_NAME_BYTES', 512 );
+define( 'BRANDAGENT_CONNECTOR_MAXIMUM_DISPLAY_NAME_LENGTH', 80 );
 define( 'BRANDAGENT_CONNECTOR_MAXIMUM_SERVICE_CATALOG_BYTES', 256 * 1024 );
 
 /**
@@ -191,6 +192,80 @@ function brandagent_connectors_parse_boolean( $value ) {
 	}
 
 	return null;
+}
+
+/**
+ * Count a UTF-8 string using the UTF-16 code units used by JavaScript and AdsAgentServer.
+ *
+ * @param mixed $value Candidate string.
+ * @return int|null UTF-16 length.
+ */
+function brandagent_connectors_utf16_length( $value ) {
+	if ( ! is_string( $value ) ) {
+		return null;
+	}
+
+	$characters = preg_split( '//u', $value, -1, PREG_SPLIT_NO_EMPTY );
+	if ( false === $characters ) {
+		return null;
+	}
+
+	$length = 0;
+	foreach ( $characters as $character ) {
+		$length += 4 === strlen( $character ) ? 2 : 1;
+	}
+
+	return $length;
+}
+
+/**
+ * Derive the legacy display-name fallback using the AdsAgentServer truncation rule.
+ *
+ * @param string $name Valid canonical service name.
+ * @return string|null Safe display name.
+ */
+function brandagent_connectors_default_display_name( $name ) {
+	$characters = preg_split( '//u', $name, -1, PREG_SPLIT_NO_EMPTY );
+	if ( false === $characters ) {
+		return null;
+	}
+
+	$display_name = '';
+	$length       = 0;
+	foreach ( $characters as $character ) {
+		$character_length = 4 === strlen( $character ) ? 2 : 1;
+		if ( $length + $character_length > BRANDAGENT_CONNECTOR_MAXIMUM_DISPLAY_NAME_LENGTH ) {
+			break;
+		}
+
+		$display_name .= $character;
+		$length       += $character_length;
+	}
+
+	$display_name = rtrim( $display_name );
+	return '' === $display_name ? null : $display_name;
+}
+
+/**
+ * Validate a merchant-owned service display name.
+ *
+ * @param mixed $value Candidate display name.
+ * @return string|null Valid display name.
+ */
+function brandagent_connectors_validate_display_name( $value ) {
+	$display_name_length = brandagent_connectors_utf16_length( $value );
+	if (
+		! is_string( $value )
+		|| '' === $value
+		|| trim( $value ) !== $value
+		|| null === $display_name_length
+		|| $display_name_length > BRANDAGENT_CONNECTOR_MAXIMUM_DISPLAY_NAME_LENGTH
+		|| preg_match( '/[\x00-\x1F\x7F]/', $value )
+	) {
+		return null;
+	}
+
+	return $value;
 }
 
 /**
@@ -511,6 +586,21 @@ function brandagent_connectors_execute_operation(
 	}
 
 	/**
+	 * Parse a persisted duration, allowing zero only for an unselected service.
+	 *
+	 * @param mixed $value    Candidate duration.
+	 * @param bool  $selected Whether the service is selected.
+	 * @return int|null Parsed duration or null when invalid.
+	 */
+	function brandagent_connectors_parse_persisted_duration_minutes( $value, $selected ) {
+		if ( false === $selected && 0 === $value ) {
+			return 0;
+		}
+
+		return brandagent_connectors_parse_duration_minutes( $value );
+	}
+
+	/**
 	 * Parse legacy or structured Housecall Pro configuration.
 	 *
 	 * @param mixed $configuration    Structured browser configuration.
@@ -558,6 +648,54 @@ function brandagent_connectors_execute_operation(
 			return array(
 				'mode'            => 'default',
 				'durationMinutes' => $validated_duration,
+			);
+		}
+
+		if ( 'display_names' === $configuration['mode'] ) {
+			if (
+				! isset( $configuration['services'] )
+				|| ! is_array( $configuration['services'] )
+				|| empty( $configuration['services'] )
+				|| count( $configuration['services'] ) > BRANDAGENT_CONNECTOR_MAXIMUM_SERVICE_COUNT
+			) {
+				return new WP_Error(
+					'invalid_configuration',
+					'Enter valid Housecall Pro product names.',
+					array( 'status' => 400 )
+				);
+			}
+
+			$services    = array();
+			$service_ids = array();
+			foreach ( $configuration['services'] as $service ) {
+				$service_id   = is_array( $service ) && isset( $service['serviceId'] )
+					? brandagent_connectors_validate_service_id( $service['serviceId'] )
+					: null;
+				$display_name = is_array( $service ) && isset( $service['displayName'] )
+					? brandagent_connectors_validate_display_name( $service['displayName'] )
+					: null;
+				if (
+					null === $service_id
+					|| null === $display_name
+					|| isset( $service_ids[ $service_id ] )
+				) {
+					return new WP_Error(
+						'invalid_configuration',
+						'Enter valid Housecall Pro product names.',
+						array( 'status' => 400 )
+					);
+				}
+
+				$service_ids[ $service_id ] = true;
+				$services[]                 = array(
+					'serviceId'   => $service_id,
+					'displayName' => $display_name,
+				);
+			}
+
+			return array(
+				'mode'     => 'display_names',
+				'services' => $services,
 			);
 		}
 
@@ -836,10 +974,15 @@ function brandagent_connectors_execute_operation(
 			return $catalog;
 		}
 
-		$submitted_durations = array();
+		$submitted_durations    = array();
+		$submitted_display_names = array();
 		if ( 'per_service' === $configuration['mode'] ) {
 			foreach ( $configuration['services'] as $service ) {
 				$submitted_durations[ $service['serviceId'] ] = $service['durationMinutes'];
+			}
+		} elseif ( 'display_names' === $configuration['mode'] ) {
+			foreach ( $configuration['services'] as $service ) {
+				$submitted_display_names[ $service['serviceId'] ] = $service['displayName'];
 			}
 		}
 
@@ -849,28 +992,38 @@ function brandagent_connectors_execute_operation(
 			$duration = 'default' === $configuration['mode']
 				? $configuration['durationMinutes']
 				: (
-					isset( $submitted_durations[ $service['serviceId'] ] )
-						? $submitted_durations[ $service['serviceId'] ]
-						: BRANDAGENT_CONNECTOR_DEFAULT_DURATION_MINUTES
+					'per_service' === $configuration['mode']
+						? (
+							isset( $submitted_durations[ $service['serviceId'] ] )
+								? $submitted_durations[ $service['serviceId'] ]
+								: BRANDAGENT_CONNECTOR_DEFAULT_DURATION_MINUTES
+						)
+						: $service['durationMinutes']
 				);
+			$display_name = isset( $submitted_display_names[ $service['serviceId'] ] )
+				? $submitted_display_names[ $service['serviceId'] ]
+				: $service['displayName'];
 			unset( $submitted_durations[ $service['serviceId'] ] );
+			unset( $submitted_display_names[ $service['serviceId'] ] );
 
 			$desired_services[] = array(
 				'serviceId'        => $service['serviceId'],
-				'selected'         => true,
+				'selected'         => 'display_names' === $configuration['mode'] ? $service['selected'] : true,
 				'durationMinutes'  => $duration,
 				'amountMinorUnits' => $service['amountMinorUnits'],
 				'currency'         => $service['currency'],
+				'displayName'      => $display_name,
 			);
 			$safe_services[]    = array(
 				'serviceId'       => $service['serviceId'],
 				'name'            => $service['name'],
-				'selected'        => true,
+				'displayName'     => $display_name,
+				'selected'        => 'display_names' === $configuration['mode'] ? $service['selected'] : true,
 				'durationMinutes' => $duration,
 			);
 		}
 
-		if ( ! empty( $submitted_durations ) ) {
+		if ( ! empty( $submitted_durations ) || ! empty( $submitted_display_names ) ) {
 			return new WP_Error(
 				'stale_service_catalog',
 				'Housecall Pro services changed. Review the refreshed service list and try again.',
@@ -975,9 +1128,13 @@ function brandagent_connectors_execute_operation(
 			$name       = is_array( $service ) && isset( $service['name'] )
 				? brandagent_connectors_validate_service_name( $service['name'] )
 				: null;
+			$display_name = is_array( $service ) && isset( $service['displayName'] )
+				? brandagent_connectors_validate_display_name( $service['displayName'] )
+				: ( null !== $name ? brandagent_connectors_default_display_name( $name ) : null );
 			if (
 				null === $service_id
 				|| null === $name
+				|| null === $display_name
 				|| isset( $service_ids[ $service_id ] )
 			) {
 				return new WP_Error(
@@ -988,7 +1145,9 @@ function brandagent_connectors_execute_operation(
 			}
 
 			if (
-				! array_key_exists( 'amountMinorUnits', $service )
+				! array_key_exists( 'selected', $service )
+				|| ! array_key_exists( 'durationMinutes', $service )
+				|| ! array_key_exists( 'amountMinorUnits', $service )
 				|| ! array_key_exists( 'currency', $service )
 			) {
 				return new WP_Error(
@@ -999,7 +1158,12 @@ function brandagent_connectors_execute_operation(
 			}
 
 			if (
-				! is_int( $service['amountMinorUnits'] )
+				! is_bool( $service['selected'] )
+				|| null === brandagent_connectors_parse_persisted_duration_minutes(
+					$service['durationMinutes'],
+					$service['selected']
+				)
+				|| ! is_int( $service['amountMinorUnits'] )
 				|| $service['amountMinorUnits'] < 0
 				|| (
 					null !== $service['currency']
@@ -1020,6 +1184,9 @@ function brandagent_connectors_execute_operation(
 			$canonical[]                = array(
 				'serviceId'        => $service_id,
 				'name'             => $name,
+				'displayName'      => $display_name,
+				'selected'         => $service['selected'],
+				'durationMinutes'  => $service['durationMinutes'],
 				'amountMinorUnits' => $service['amountMinorUnits'],
 				'currency'         => $service['currency'],
 			);
@@ -1293,6 +1460,7 @@ function brandagent_connectors_get_status() {
 		'supportedProviderIds'            => brandagent_connectors_get_available_provider_ids( $status['providers'] ),
 		'apiKeyValidationProviderIds'     => array( BRANDAGENT_CONNECTOR_HOUSECALL_PRO_PROVIDER_ID ),
 		'apiKeyServicePreviewProviderIds' => array( BRANDAGENT_CONNECTOR_HOUSECALL_PRO_PROVIDER_ID ),
+		'displayNameConfigurationProviderIds' => array( BRANDAGENT_CONNECTOR_HOUSECALL_PRO_PROVIDER_ID ),
 	);
 }
 
@@ -1438,12 +1606,19 @@ function brandagent_connectors_project_housecall_pro_services_for_ui( $connector
 		$name       = is_array( $service ) && isset( $service['name'] )
 			? brandagent_connectors_validate_service_name( $service['name'] )
 			: null;
-		$duration   = is_array( $service ) && isset( $service['durationMinutes'] )
-			? brandagent_connectors_parse_duration_minutes( $service['durationMinutes'] )
+		$display_name = is_array( $service ) && isset( $service['displayName'] )
+			? brandagent_connectors_validate_display_name( $service['displayName'] )
+			: ( null !== $name ? brandagent_connectors_default_display_name( $name ) : null );
+		$duration   = is_array( $service ) && isset( $service['durationMinutes'] ) && isset( $service['selected'] )
+			? brandagent_connectors_parse_persisted_duration_minutes(
+				$service['durationMinutes'],
+				$service['selected']
+			)
 			: null;
 		if (
 			null === $service_id
 			|| null === $name
+			|| null === $display_name
 			|| null === $duration
 			|| ! isset( $service['selected'] )
 			|| ! is_bool( $service['selected'] )
@@ -1460,6 +1635,7 @@ function brandagent_connectors_project_housecall_pro_services_for_ui( $connector
 		$projected[]                = array(
 			'serviceId'       => $service_id,
 			'name'            => $name,
+			'displayName'     => $display_name,
 			'selected'        => $service['selected'],
 			'durationMinutes' => $duration,
 		);

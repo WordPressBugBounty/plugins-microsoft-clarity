@@ -195,6 +195,16 @@ function brandagent_wordpress_connect_locked( $request = null, $allow_stale_site
 		return array( 'success' => false, 'error' => 'WooCommerce site must use the WooCommerce connect flow.' );
 	}
 
+	$store_url = brandagent_get_connected_store_url();
+	if ( false === brandagent_get_frontend_proxy_base_path() ) {
+		brandagent_log( 'BrandAgent WordPress Connect: connected store URL cannot produce a safe frontend proxy route' );
+		return array(
+			'success'    => false,
+			'error'      => 'Connected store URL cannot be used for frontend routing.',
+			'error_code' => 'invalid_frontend_routing',
+		);
+	}
+
 	if ( null !== $request ) {
 		$project_result = brandagent_wordpress_prepare_connect_project_id( $request );
 		if ( empty( $project_result['success'] ) ) {
@@ -210,7 +220,6 @@ function brandagent_wordpress_connect_locked( $request = null, $allow_stale_site
 
 	// Reconnects rotate credentials for the existing connection; they do not let a request-context
 	// home_url() (locale, proxy, or alternate domain) silently rebind its backend identity.
-	$store_url          = brandagent_get_connected_store_url();
 	$project_id         = get_option( 'clarity_project_id', '' );
 	$wp_site_id         = get_option( 'clarity_wordpress_site_id', '' );
 	$recover_wp_site_id = '' === $wp_site_id;
@@ -321,10 +330,10 @@ function brandagent_wordpress_connect_locked( $request = null, $allow_stale_site
 			return $retry_result;
 		}
 
-		// A remaining platform conflict means an unsupported owner or a concurrent ownership change.
+		// A remaining platform or site-identity conflict means an unsupported owner or a concurrent ownership change.
 		// Do not let admin_init retry it on every admin visit and create an avoidable request storm;
 		// the next explicit Continue starts a fresh, authenticated attempt.
-		if ( 409 === $code && 'platform_mismatch' === $error_code ) {
+		if ( 409 === $code && in_array( $error_code, array( 'platform_mismatch', 'site_identity_collision' ), true ) ) {
 			brandagent_wordpress_clear_connect_retry_state();
 		}
 
@@ -521,10 +530,20 @@ function brandagent_wordpress_connect_verify( WP_REST_Request $request ) {
 	// callback must not remain replayable with different values during the nonce TTL.
 	delete_transient( $key );
 	delete_transient( $recovery_key );
+	if ( false === brandagent_get_frontend_proxy_base_path() ) {
+		return new WP_REST_Response( array( 'verified' => false, 'error' => 'invalid_frontend_routing' ), 409 );
+	}
 
-	// Existing non-empty-ID connects have no recovery context and retain their exact legacy reply.
+	// Existing non-empty-ID connects have no recovery context. Advertise only the additive runtime
+	// routing capability after the nonce has proved ownership.
 	if ( false === $recovery_context ) {
-		return new WP_REST_Response( array( 'verified' => true ), 200 );
+		return new WP_REST_Response(
+			array(
+				'verified'     => true,
+				'capabilities' => array( 'subdirectoryRuntimeRouting' => 1 ),
+			),
+			200
+		);
 	}
 
 	if (
@@ -573,6 +592,7 @@ function brandagent_wordpress_connect_verify( WP_REST_Request $request ) {
 			'verified'                 => true,
 			'wordpressSiteIdPersisted' => true,
 			'wordpressSiteId'          => $persisted_site_id,
+			'capabilities'             => array( 'subdirectoryRuntimeRouting' => 1 ),
 		),
 		200
 	);

@@ -408,7 +408,8 @@ function brandagent_is_woocommerce_store() {
  * @return string Normalized store URL
  */
 function brandagent_normalize_store_url( $store_url ) {
-    $normalized = strtolower( str_replace( array( 'https://', 'http://' ), '', rtrim( $store_url, '/' ) ) );
+    $normalized = strtolower( rtrim( $store_url, '/' ) );
+    $normalized = str_replace( array( 'https://', 'http://' ), '', $normalized );
     // Replace dots, slashes, and colons with hyphens to produce a valid Key Vault / Azure Search
     // identifier and HMAC client id. Must stay identical to the backend C# NormalizeStoreUrl so
     // plugin-signed requests verify; the colon only affects host:port dev stores (production
@@ -437,6 +438,254 @@ function brandagent_get_connected_store_url() {
     }
 
     return brandagent_canonicalize_connected_store_url( home_url() );
+}
+
+/**
+ * Determine whether a URL fits the backend credential-name contract.
+ *
+ * @param string      $site_url WordPress URL identity.
+ * @param string|null $platform Credential platform, or null to use the established platform.
+ * @return bool True when the identity can be stored in Azure Key Vault.
+ */
+function brandagent_is_safe_frontend_proxy_credential_identity( $site_url, $platform = null ) {
+    $credential_identity = brandagent_normalize_store_url( $site_url );
+
+    if ( null === $platform ) {
+        $platform = brandagent_get_hmac_platform();
+        // Before the first credential is issued, only the plain WordPress Connect flow reaches the
+        // shared routing check. WooCommerce OAuth passes its platform explicitly below.
+        $platform = '' === $platform ? 'wordpress' : $platform;
+    }
+
+    if ( ! in_array( $platform, array( 'wordpress', 'woocommerce' ), true ) ) {
+        return false;
+    }
+
+    $credential_prefix = 'woocommerce' === $platform
+        ? 'appkeys-woocommerce-'
+        : 'appkeys-wordpress-';
+
+    return (
+        1 === preg_match( '/^[a-z0-9-]+$/', $credential_identity ) &&
+        strlen( $credential_prefix . $credential_identity . '-hmac-secret' ) <= 127
+    );
+}
+
+/**
+ * Parse an absolute WordPress URL and reject unsupported URL components.
+ *
+ * @param string $site_url WordPress URL to parse.
+ * @return array|false Parsed URL parts, or false when unsafe.
+ */
+function brandagent_parse_safe_frontend_proxy_url( $site_url ) {
+    $parts = function_exists( 'wp_parse_url' )
+        ? wp_parse_url( $site_url )
+        : parse_url( $site_url ); // phpcs:ignore WordPress.WP.AlternativeFunctions.parse_url_parse_url -- Required for the declared WordPress 4.0 minimum.
+
+    if (
+        ! is_array( $parts ) ||
+        empty( $parts['scheme'] ) ||
+        ! in_array( strtolower( $parts['scheme'] ), array( 'http', 'https' ), true ) ||
+        empty( $parts['host'] ) ||
+        ! is_string( $parts['host'] ) ||
+        isset( $parts['user'] ) ||
+        isset( $parts['pass'] ) ||
+        isset( $parts['query'] ) ||
+        isset( $parts['fragment'] )
+    ) {
+        return false;
+    }
+
+    return $parts;
+}
+
+/**
+ * Validate the parsed authority for same-origin frontend routing.
+ *
+ * @param string $host Parsed URL host.
+ * @return bool True when structurally safe.
+ */
+function brandagent_is_safe_frontend_proxy_host( $host ) {
+    // Bracketed IPv6 remains structurally checked even though the credential contract excludes it.
+    if ( '[' === $host[0] && ']' === substr( $host, -1 ) ) {
+        return false !== filter_var( substr( $host, 1, -1 ), FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 );
+    }
+
+    if (
+        false !== strpos( $host, ':' ) ||
+        1 === preg_match( '/[%\\\\\/?#@\s\x00-\x1f\x7f]/u', $host )
+    ) {
+        return false;
+    }
+
+    $host_for_labels = '.' === substr( $host, -1 ) ? substr( $host, 0, -1 ) : $host;
+    if ( '' === $host_for_labels ) {
+        return false;
+    }
+
+    foreach ( explode( '.', $host_for_labels ) as $label ) {
+        if (
+            '' === $label ||
+            '-' === $label[0] ||
+            '-' === substr( $label, -1 ) ||
+            1 !== preg_match( '/^[\p{L}\p{N}\p{M}-]+$/u', $label )
+        ) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Validate the optional port without allowing scheme-confusing combinations.
+ *
+ * @param array $parts Parsed URL parts.
+ * @return bool True when the port is safe.
+ */
+function brandagent_is_safe_frontend_proxy_port( $parts ) {
+    if ( ! isset( $parts['port'] ) ) {
+        return true;
+    }
+
+    return (
+        is_int( $parts['port'] ) &&
+        $parts['port'] >= 1 &&
+        $parts['port'] <= 65535 &&
+        ! ( 'https' === strtolower( $parts['scheme'] ) && 80 === $parts['port'] ) &&
+        ! ( 'http' === strtolower( $parts['scheme'] ) && 443 === $parts['port'] )
+    );
+}
+
+/**
+ * Validate and normalize an installation pathname for frontend routing.
+ *
+ * @param mixed $path Raw URL path.
+ * @return string|false Installation path without a trailing slash, or false when unsafe.
+ */
+function brandagent_get_safe_frontend_proxy_path( $path ) {
+    if (
+        ! is_string( $path ) ||
+        '' === $path ||
+        '/' !== $path[0] ||
+        1 !== preg_match( '//u', $path ) ||
+        1 === preg_match( '/\s/u', $path )
+    ) {
+        return false;
+    }
+
+    // Encoded percent, dot and separator bytes are ambiguous after browser/server normalization.
+    if (
+        false !== strpos( $path, '\\' ) ||
+        false !== strpos( $path, '//' ) ||
+        1 === preg_match( '/%(?![0-9a-f]{2})/i', $path ) ||
+        1 === preg_match( '/%(?:25|2e|2f|5c)/i', $path ) ||
+        1 === preg_match( '/[\x00-\x1f\x7f]/', $path )
+    ) {
+        return false;
+    }
+
+    $decoded_path = rawurldecode( $path );
+    if (
+        1 !== preg_match( '//u', $decoded_path ) ||
+        false !== strpos( $decoded_path, '\\' ) ||
+        false !== strpos( $decoded_path, '//' ) ||
+        false !== strpos( $decoded_path, '?' ) ||
+        false !== strpos( $decoded_path, '#' ) ||
+        1 === preg_match( '/[\x00-\x1f\x7f]/', $decoded_path )
+    ) {
+        return false;
+    }
+
+    foreach ( explode( '/', $decoded_path ) as $segment ) {
+        if ( '.' === $segment || '..' === $segment ) {
+            return false;
+        }
+    }
+
+    return '/' === $path ? '' : rtrim( $path, '/' );
+}
+
+/**
+ * Return a validated installation path from an absolute WordPress URL.
+ *
+ * @param mixed $site_url                    URL to validate.
+ * @param bool        $require_credential_identity Whether the URL must fit the backend credential-name contract.
+ * @param string|null $platform                    Credential platform when the identity check is required.
+ * @return string|false Installation path without a trailing slash, or false when unsafe.
+ */
+function brandagent_get_safe_installation_path_from_url( $site_url, $require_credential_identity = false, $platform = null ) {
+    if (
+        ! is_string( $site_url ) ||
+        ( $require_credential_identity && ! brandagent_is_safe_frontend_proxy_credential_identity( $site_url, $platform ) )
+    ) {
+        return false;
+    }
+
+    $parts = brandagent_parse_safe_frontend_proxy_url( $site_url );
+    if (
+        false === $parts ||
+        ! brandagent_is_safe_frontend_proxy_host( $parts['host'] ) ||
+        ! brandagent_is_safe_frontend_proxy_port( $parts )
+    ) {
+        return false;
+    }
+
+    $path = isset( $parts['path'] ) ? $parts['path'] : '/';
+    return brandagent_get_safe_frontend_proxy_path( $path );
+}
+
+/**
+ * Return the stable WordPress installation path used by the frontend proxy and rewrite matcher.
+ *
+ * The persisted connected URL remains the immutable HMAC/credential identity. It can legitimately
+ * differ from the configured home path when home_url() is filtered by locale, proxy or request
+ * context, so it must never choose the browser's same-origin route. Both URLs still fail closed:
+ * the credential identity must remain usable and the configured home must be a safe route base.
+ *
+ * @param string|null $platform Credential platform, or null to use the established platform.
+ * @return string|false Installation path without a trailing slash, or false when unsafe.
+ */
+function brandagent_get_frontend_proxy_installation_path( $platform = null ) {
+    $missing_store_url = new stdClass();
+    $store_url         = get_option( 'brandagent_connected_store_url', $missing_store_url );
+    if ( $missing_store_url === $store_url ) {
+        $store_url = home_url( '/' );
+    }
+
+    if ( false === brandagent_get_safe_installation_path_from_url( $store_url, true, $platform ) ) {
+        return false;
+    }
+
+    return brandagent_get_safe_installation_path_from_url( get_option( 'home', '' ) );
+}
+
+/**
+ * Return the same-origin proxy base used by the injected Brand Agent frontend.
+ *
+ * @param string|null $platform Credential platform, or null to use the established platform.
+ * @return string|false Absolute-path proxy base, or false when routing state is unsafe.
+ */
+function brandagent_get_frontend_proxy_base_path( $platform = null ) {
+    $installation_path = brandagent_get_frontend_proxy_installation_path( $platform );
+    if ( false === $installation_path ) {
+        return false;
+    }
+
+    // Custom rewrite rules are not generated when plain permalinks are enabled, so there is no
+    // safe path-form proxy to advertise in that mode. PATHINFO/index permalinks do generate the
+    // rule, but the public URL must include WordPress's front controller to reach it on servers
+    // that do not have mod_rewrite available.
+    $permalink_structure = get_option( 'permalink_structure', '' );
+    if ( ! is_string( $permalink_structure ) || '' === $permalink_structure ) {
+        return false;
+    }
+
+    $front_controller = 1 === preg_match( '#^/*index\.php(?:/|$)#', $permalink_structure )
+        ? '/index.php'
+        : '';
+
+    return $installation_path . $front_controller . '/a/msba/';
 }
 
 /**
@@ -477,6 +726,10 @@ function brandagent_has_connected_store_url() {
  * @return string|WP_Error Stable URL, or an error when setup should be retried.
  */
 function brandagent_prepare_woocommerce_oauth_url() {
+    if ( false === brandagent_get_frontend_proxy_base_path( 'woocommerce' ) ) {
+        return new WP_Error( 'brandagent_invalid_frontend_routing', 'Connected store URL cannot be used for frontend routing.' );
+    }
+
     if ( brandagent_has_connected_store_url() ) {
         return brandagent_get_connected_store_url();
     }
@@ -522,6 +775,12 @@ function brandagent_prepare_woocommerce_oauth_url() {
  * @return string|WP_Error Confirmed or pending URL, never a fresh request-context URL.
  */
 function brandagent_get_woocommerce_oauth_callback_url() {
+    // Revalidate the configured public home route at callback time. Permalink or installation
+    // changes after the dashboard handoff must fail before a credential is fetched or committed.
+    if ( false === brandagent_get_frontend_proxy_base_path( 'woocommerce' ) ) {
+        return new WP_Error( 'brandagent_invalid_frontend_routing', 'Connected store URL cannot be used for frontend routing.' );
+    }
+
     $pending_url = brandagent_canonicalize_connected_store_url( get_transient( 'brandagent_woocommerce_oauth_store_url' ) );
     if ( brandagent_has_connected_store_url() ) {
         $connected_url = brandagent_get_connected_store_url();

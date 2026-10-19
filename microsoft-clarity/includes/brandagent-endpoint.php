@@ -23,6 +23,12 @@ class BrandAgent_Endpoint {
     public static function handle_request() {
         $path = get_query_var( 'brandagent_path' );
 
+        // The storefront requests the canonical trailing-slash form. Normalize exactly one slash so
+        // malformed paths with repeated separators do not become valid endpoint names.
+        if ( is_string( $path ) && '/' === substr( $path, -1 ) ) {
+            $path = substr( $path, 0, -1 );
+        }
+
         if ( $path === 'api/config/read' ) {
             self::handle_config_read();
         }
@@ -366,27 +372,35 @@ class BrandAgent_Endpoint {
             'new_value' => $new_value ? 'true' : 'false',
         ) );
 
-        // Create webhooks once when inject=true AND OAuth has succeeded.
+        // Create or reconcile webhooks when inject=true and OAuth has succeeded.
         if ( $new_value
              && get_option( 'BAOauthSuccess' ) == 1
-             && ! get_option( 'BAWebhooksCreated' ) ) {
+             && ( ! get_option( 'BAWebhooksCreated' )
+                  || ! get_option( 'BACollectionWebhooksMigrationDone' ) ) ) {
             // BA server has already handled complete-onboarding via PublishAgent.
             // The plugin's only job here is to register WooCommerce webhooks.
-            if ( class_exists( 'BrandAgent_Webhooks' ) ) {
-                $results       = BrandAgent_Webhooks::create_webhooks();
+            if ( brandagent_get_hmac_platform() !== 'woocommerce' ) {
+                brandagent_log( 'BrandAgent Config Update: Skipping webhook reconciliation; HMAC platform is not WooCommerce', array(
+                    'hmac_platform' => brandagent_get_hmac_platform(),
+                ) );
+            } elseif ( class_exists( 'BrandAgent_Webhooks' ) ) {
+                $results       = get_option( 'BAWebhooksCreated' )
+                    ? BrandAgent_Webhooks::create_collection_webhooks()
+                    : BrandAgent_Webhooks::create_webhooks();
                 $webhook_count = is_array( $results ) ? count( $results ) : 0;
                 $success_count = is_array( $results ) ? count( array_filter( $results ) ) : 0;
                 $failure_count = $webhook_count - $success_count;
                 $all_succeeded = ( 0 < $webhook_count && 0 === $failure_count );
                 if ( $all_succeeded ) {
                     update_option( 'BAWebhooksCreated', true );
-                    brandagent_log( 'BrandAgent Config Update: Webhooks created on store approval', array(
+                    update_option( 'BACollectionWebhooksMigrationDone', true );
+                    brandagent_log( 'BrandAgent Config Update: Webhooks reconciled after configuration update', array(
                         'webhook_count' => $webhook_count,
                         'success_count' => $success_count,
                         'failure_count' => $failure_count,
                     ) );
                 } else {
-                    // Do NOT persist BAWebhooksCreated on partial/failed creation so future attempts can retry.
+                    // Keep migration incomplete so future configuration updates can retry.
                     brandagent_log( 'BrandAgent Config Update: Webhook creation incomplete; will retry on next update', array(
                         'webhook_count' => $webhook_count,
                         'success_count' => $success_count,
@@ -394,7 +408,7 @@ class BrandAgent_Endpoint {
                     ) );
                 }
             } else {
-                brandagent_log( 'BrandAgent Config Update: BrandAgent_Webhooks class not available for store approval webhook creation' );
+                brandagent_log( 'BrandAgent Config Update: BrandAgent_Webhooks class not available for webhook reconciliation' );
             }
         } else {
             brandagent_log( 'BrandAgent Config Update: No onboarding side effects required', array(

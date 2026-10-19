@@ -62,8 +62,33 @@ class BrandAgent_Webhooks {
 	 * @return array Array of results with webhook names and success status
 	 */
 	public static function create_webhooks() {
+		return self::create_webhooks_from_configs( self::get_webhook_configs() );
+	}
+
+	/**
+	 * Create or update BrandAgent collection webhooks.
+	 *
+	 * @return array Array of results with webhook names and success status
+	 */
+	public static function create_collection_webhooks() {
+		$webhook_configs = array_filter(
+			self::get_webhook_configs(),
+			function ( $config ) {
+				return strpos( $config['topic'], 'product_cat.' ) === 0;
+			}
+		);
+
+		return self::create_webhooks_from_configs( $webhook_configs );
+	}
+
+	/**
+	 * Create or update the provided BrandAgent webhook configurations.
+	 *
+	 * @param array $webhook_configs Webhook configurations to reconcile
+	 * @return array Array of results with webhook names and success status
+	 */
+	private static function create_webhooks_from_configs( $webhook_configs ) {
 		$results = array();
-		$webhook_configs = self::get_webhook_configs();
 		brandagent_log( 'BrandAgent Webhooks: Creating or updating configured webhooks', array( 'config_count' => count( $webhook_configs ) ) );
 
 		foreach ( $webhook_configs as $config_file => $config ) {

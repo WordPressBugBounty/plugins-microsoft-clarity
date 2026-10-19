@@ -3,7 +3,7 @@
  * BrandAgent Custom Webhooks
  *
  * Registers custom webhook topics for WooCommerce that aren't built-in
- * (e.g., cart updates)
+ * (e.g., cart updates and product category changes)
  *
  * @package MicrosoftClarity
  * @since 0.10.21
@@ -13,15 +13,16 @@
 defined( 'ABSPATH' ) || exit;
 
 /**
- * Register 'cart' and 'checkout' as valid webhook resources
- * This is required for WooCommerce to accept 'cart.updated' and 'checkout.started' as valid topics
+ * Register BrandAgent custom webhook resources.
+ * This is required for WooCommerce to accept their topics.
  *
  * @param array $resources Valid webhook resources (order, product, customer, coupon)
- * @return array Modified resources including 'cart' and 'checkout'
+ * @return array Modified resources including BrandAgent custom resources
  */
 function brandagent_register_custom_webhook_resources( $resources ) {
     $resources[] = 'cart';
     $resources[] = 'checkout';
+    $resources[] = 'product_cat';
     return $resources;
 }
 add_filter( 'woocommerce_valid_webhook_resources', 'brandagent_register_custom_webhook_resources' );
@@ -55,37 +56,64 @@ add_filter( 'woocommerce_valid_webhook_events', 'brandagent_register_custom_webh
 function brandagent_register_custom_webhook_topics( $topics ) {
     $topics['cart.updated'] = __( 'Cart Updated', 'microsoft-clarity' );
     $topics['checkout.created'] = __( 'Checkout Created', 'microsoft-clarity' );
+    $topics['product_cat.created'] = __( 'Product Category Created', 'microsoft-clarity' );
+    $topics['product_cat.updated'] = __( 'Product Category Updated', 'microsoft-clarity' );
+    $topics['product_cat.deleted'] = __( 'Product Category Deleted', 'microsoft-clarity' );
     return $topics;
 }
 add_filter( 'woocommerce_webhook_topics', 'brandagent_register_custom_webhook_topics' );
 
 /**
- * Register valid webhook events for custom topics
+ * Register the WordPress actions that trigger custom webhook topics.
+ * Cart and checkout use BrandAgent_Cart_Webhook_Trigger and
+ * BrandAgent_Checkout_Webhook_Trigger for manual delivery, so they must not
+ * also be registered here or WooCommerce could deliver duplicate events.
  *
- * @param array $events Valid events for the topic
- * @param string $topic The webhook topic
- * @return array Modified events
+ * @param array $topic_hooks Map of webhook topics to WordPress action names.
+ * @return array Modified topic hook map.
  */
-function brandagent_register_custom_webhook_topic_events( $events, $topic ) {
-    if ( 'cart.updated' === $topic ) {
-        $events = array(
-            'woocommerce_add_to_cart',
-            'woocommerce_cart_item_removed',
-            'woocommerce_cart_item_restored',
-            'woocommerce_after_cart_item_quantity_update',
-        );
-    }
-    
-    if ( 'checkout.created' === $topic ) {
-        // This is manually triggered, but we need a placeholder hook
-        $events = array(
-            'brandagent_checkout_created',
-        );
-    }
-    
-    return $events;
+function brandagent_register_custom_webhook_topic_events( $topic_hooks ) {
+    $topic_hooks['product_cat.created'] = array(
+        'created_product_cat',
+    );
+    $topic_hooks['product_cat.updated'] = array(
+        'edited_product_cat',
+    );
+    $topic_hooks['product_cat.deleted'] = array(
+        'delete_product_cat',
+    );
+
+    return $topic_hooks;
 }
-add_filter( 'woocommerce_webhook_topic_hooks', 'brandagent_register_custom_webhook_topic_events', 10, 2 );
+add_filter( 'woocommerce_webhook_topic_hooks', 'brandagent_register_custom_webhook_topic_events' );
+
+/**
+ * Build the compact payload used by BrandAgent product category webhooks.
+ *
+ * @param array  $payload The webhook payload.
+ * @param string $resource The resource type.
+ * @param int    $resource_id The resource ID.
+ * @param int    $webhook_id The webhook ID.
+ * @return array The modified payload.
+ */
+function brandagent_product_category_webhook_payload( $payload, $resource, $resource_id, $webhook_id ) {
+    if ( 'product_cat' !== $resource ) {
+        return $payload;
+    }
+
+    $webhook = wc_get_webhook( $webhook_id );
+
+    if ( ! $webhook
+        || strpos( $webhook->get_name(), 'BrandAgent' ) !== 0
+        || strpos( $webhook->get_topic(), 'product_cat.' ) !== 0 ) {
+        return $payload;
+    }
+
+    return array(
+        'id' => (int) $resource_id,
+    );
+}
+add_filter( 'woocommerce_webhook_payload', 'brandagent_product_category_webhook_payload', 10, 4 );
 
 /**
  * Build the payload for cart webhooks
